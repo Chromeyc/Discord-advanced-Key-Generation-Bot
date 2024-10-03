@@ -2,18 +2,15 @@ import discord
 import json
 import random
 import string
-from datetime import datetime, timedelta
+import arrow
 from discord.ext import commands, tasks
-from discord import app_commands
 
-TOKEN = "YOUR-BOT-TOKEN-HERE"
-
+TOKEN = "YOUR-BOT-TOKEN"  # Replace with your actual bot token
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 try:
     with open('Database.json', 'r') as f:
@@ -36,25 +33,32 @@ def generate_key():
 
 def get_expiration_time(time_str):
     """Calculate expiration time."""
-    now = datetime.utcnow()
-    if time_str.endswith('d'):
-        return now + timedelta(days=int(time_str[:-1]))
+    now = arrow.utcnow()  # Get current time in UTC
+    time_str = time_str.lower()  # Convert to lowercase for consistency
+
+    if time_str.endswith('s'):
+        return now.shift(seconds=int(time_str[:-1]))
+    elif time_str.endswith('min'):
+        return now.shift(minutes=int(time_str[:-3]))
+    elif time_str.endswith('h'):
+        return now.shift(hours=int(time_str[:-1]))
+    elif time_str.endswith('d'):
+        return now.shift(days=int(time_str[:-1]))
     elif time_str.endswith('w'):
-        return now + timedelta(weeks=int(time_str[:-1]))
+        return now.shift(weeks=int(time_str[:-1]))
     elif time_str.endswith('m'):
-        return now + timedelta(days=int(time_str[:-1]) * 30)
+        return now.shift(months=int(time_str[:-1]))
     elif time_str.endswith('y'):
-        return now + timedelta(days=int(time_str[:-1]) * 365)
+        return now.shift(years=int(time_str[:-1]))
     elif time_str == 'life':
         return None
     else:
-        raise ValueError("Invalid time format.")
+        raise ValueError("Invalid time format. Please use numbers followed by 's', 'min', 'h', 'd', 'w', 'm', or 'y'.")
 
 async def send_keys_page(interaction, keys, page_num):
     """Display paginated keys with a cleaner design."""
     per_page = 150
     total_pages = (len(keys) + per_page - 1) // per_page
-
 
     if page_num < 1 or page_num > total_pages:
         page_num = 1
@@ -62,8 +66,7 @@ async def send_keys_page(interaction, keys, page_num):
     start_idx = (page_num - 1) * per_page
     end_idx = start_idx + per_page
 
-
-    keys_list = '\n'.join([f"{i + 1}. {k['key']}" for i, k in enumerate(keys[start_idx:end_idx])])
+    keys_list = '\n'.join([f"{i + 1}. {k['key']} | Expires: {format_remaining_time(arrow.get(k['expiration']) if k['expiration'] != 'lifetime' else None)}" for i, k in enumerate(keys[start_idx:end_idx])])
 
     embed = discord.Embed(
         title=f"🔐 Keys (Page {page_num}/{total_pages})",
@@ -73,6 +76,17 @@ async def send_keys_page(interaction, keys, page_num):
     embed.set_footer(text=f"Showing {len(keys[start_idx:end_idx])} of {len(keys)} keys")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+def format_remaining_time(expiration):
+    """Format the remaining time in a readable way."""
+    if expiration is None:
+        return "Lifetime"
+    remaining = expiration - arrow.utcnow()
+    if remaining.total_seconds() <= 0:
+        return "Expired"
+    hours, remainder = divmod(remaining.total_seconds(), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours)}h {int(minutes)}m {int(seconds)}s remaining"
 
 @bot.event
 async def on_ready():
@@ -137,7 +151,6 @@ async def redeem_key(interaction: discord.Interaction, key: str):
             entry['user_id'] = interaction.user.id
             save_database(database)
 
-            
             role_id = database[server_id]['settings'].get('role')
             if role_id:
                 role = interaction.guild.get_role(role_id)
@@ -174,9 +187,10 @@ async def info_key(interaction: discord.Interaction):
     keys_info = []
     for entry in database[server_id]['keys']:
         if entry['user_id'] == interaction.user.id:
-            status = "Active" if entry['expiration'] != "lifetime" else "Lifetime"
-            expiration = entry['expiration'] if status == "Active" else "N/A"
-            keys_info.append(f"🔑 Key: `{entry['key']}` | Status: {status} | Expires: {expiration}")
+            expiration = arrow.get(entry['expiration']) if entry['expiration'] != "lifetime" else None
+            status = "Active" if expiration else "Lifetime"
+            remaining = format_remaining_time(expiration) if expiration else "N/A"
+            keys_info.append(f"🔑 Key: `{entry['key']}` | Status: {status} | Remaining: {remaining}")
 
     if not keys_info:
         await interaction.response.send_message("❌ You have no keys.", ephemeral=True)
@@ -189,23 +203,55 @@ async def info_key(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=20)
 async def check_expired_keys():
-    now = datetime.utcnow()
+    now = arrow.utcnow()  # Current time in UTC
     for server_id, data in database.items():
         role_id = data['settings'].get('role')
         if role_id:
             guild = bot.get_guild(int(server_id))
+            if guild is None:
+                print(f"Guild not found for server_id: {server_id}")
+                continue  # Skip if guild not found
+
             role = guild.get_role(role_id)
+            if role is None:
+                print(f"Role not found for role_id: {role_id}")
+                continue  # Skip if role not found
+
             for entry in data['keys']:
                 if entry['expiration'] != "lifetime" and entry['user_id']:
-                    expiration_time = datetime.strptime(entry['expiration'], '%Y-%m-%d %H:%M:%S.%f')
-                    if now > expiration_time:
-                        user = guild.get_member(entry['user_id'])
-                        if user and role in user.roles:
-                            await user.remove_roles(role)
-                            print(f"Removed role from {user.name} due to key expiration.")
-                            entry['user_id'] = None
-                            save_database(database)
+                    expiration_time = arrow.get(entry['expiration'])
+                    
+                    try:
+                        user = await guild.fetch_member(entry['user_id'])  # Fetch member directly
+                    except discord.NotFound:
+                        print(f"User with ID {entry['user_id']} not found in guild {guild.name}.")
+                        continue  # Skip to the next entry
+                    except Exception as e:
+                        print(f"An error occurred while fetching user: {str(e)}")
+                        continue  # Skip to the next entry
 
+                    if now > expiration_time:
+                        # Remove the role from the user if they have it
+                        if role in user.roles:
+                            try:
+                                await user.remove_roles(role)
+                                await user.send(f"🚫 Your key has expired! The role '{role.name}' has been removed.")
+                                print(f"Removed role from {user.name} due to key expiration.")
+                            except discord.Forbidden:
+                                print(f"Could not remove role or send DM to {user.name}. Check permissions.")
+                            except Exception as e:
+                                print(f"An error occurred while removing role: {str(e)}")
+
+                        entry['user_id'] = None  # Mark the key as unused
+                        save_database(database)
+                        print(f"User {user.name}'s key expired and was marked as unused.")
+                    else:
+                        print(f"Key for {user.name} is still active.")
+
+
+
+
+# Start the bot
 bot.run(TOKEN)
